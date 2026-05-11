@@ -84,4 +84,46 @@ Returns:
       },
       "e"_a, "c"_a, "lse"_a, "targets"_a, "d_nll"_a, "tile_max"_a,
       "bias"_a = nb::none(), nb::kw_only(), "stream"_a = nb::none());
+
+  m.def(
+      "cce_forward_raw_quantized",
+      [](const mx::array& e,
+         const mx::array& c_weight,
+         const mx::array& c_scales,
+         const mx::array& c_biases,
+         const mx::array& targets,
+         int group_size,
+         int bits,
+         const std::optional<mx::array>& bias,
+         mx::StreamOrDevice s) {
+        return cce::cce_forward_raw_quantized(
+            e, c_weight, c_scales, c_biases, targets,
+            group_size, bits, bias.value_or(mx::array({})), s);
+      },
+      "e"_a, "c_weight"_a, "c_scales"_a, "c_biases"_a, "targets"_a,
+      "group_size"_a, "bits"_a,
+      "bias"_a = nb::none(), nb::kw_only(), "stream"_a = nb::none());
+
+  m.def(
+      "cce_backward_raw_quantized",
+      [](const mx::array& e,
+         const mx::array& c_weight,
+         const mx::array& c_scales,
+         const mx::array& c_biases,
+         const mx::array& lse,
+         const mx::array& targets,
+         const mx::array& d_nll,
+         const mx::array& tile_max,
+         int group_size,
+         int bits,
+         const std::optional<mx::array>& bias,
+         mx::StreamOrDevice s) {
+        return cce::cce_backward_raw_quantized(
+            e, c_weight, c_scales, c_biases, lse, targets, d_nll, tile_max,
+            group_size, bits, bias.value_or(mx::array({})), s);
+      },
+      "e"_a, "c_weight"_a, "c_scales"_a, "c_biases"_a,
+      "lse"_a, "targets"_a, "d_nll"_a, "tile_max"_a,
+      "group_size"_a, "bits"_a,
+      "bias"_a = nb::none(), nb::kw_only(), "stream"_a = nb::none());
 }

@@ -179,6 +179,88 @@ mx::array cce_backward_raw(
 }
 
 // =========================================================================
+// Raw forward (quantized): accepts packed 4-bit weights
+// =========================================================================
+
+std::vector<mx::array> cce_forward_raw_quantized(
+    const mx::array& e,
+    const mx::array& c_weight,
+    const mx::array& c_scales,
+    const mx::array& c_biases,
+    const mx::array& targets,
+    int group_size,
+    int bits,
+    const mx::array& bias,
+    mx::StreamOrDevice s) {
+
+  if (bits != 4)
+    throw std::invalid_argument(
+        "[cce_forward_raw_quantized] Only 4-bit quantization supported, got " +
+        std::to_string(bits));
+
+  int B = e.shape(0), D = e.shape(1);
+  int V = c_weight.shape(0);
+  bool has_bias = bias.size() > 0;
+  auto stream = mx::to_stream(s);
+  int num_v_tiles = (V + 31) / 32;
+
+  std::vector<mx::Shape> out_shapes = {
+      {B * num_v_tiles}, {B * num_v_tiles}, {B}, {B}};
+  std::vector<mx::Dtype> out_dtypes = {
+      mx::float32, mx::float32, mx::float32, mx::float32};
+
+  std::vector<mx::array> inputs = {e, c_weight, c_scales, c_biases, targets};
+  if (has_bias) inputs.push_back(bias);
+
+  auto prim = std::make_shared<CutCrossEntropyQuantized>(
+      stream, has_bias, group_size);
+  return mx::array::make_arrays(out_shapes, out_dtypes, prim, inputs);
+}
+
+// =========================================================================
+// Raw backward (quantized): takes forward outputs + d_nll, returns dE
+// =========================================================================
+
+mx::array cce_backward_raw_quantized(
+    const mx::array& e,
+    const mx::array& c_weight,
+    const mx::array& c_scales,
+    const mx::array& c_biases,
+    const mx::array& lse,
+    const mx::array& targets,
+    const mx::array& d_nll,
+    const mx::array& tile_max,
+    int group_size,
+    int bits,
+    const mx::array& bias,
+    mx::StreamOrDevice s) {
+
+  if (bits != 4)
+    throw std::invalid_argument(
+        "[cce_backward_raw_quantized] Only 4-bit quantization supported");
+
+  int B = e.shape(0), D = e.shape(1);
+  bool has_bias = bias.size() > 0;
+  auto stream = mx::to_stream(s);
+
+  std::vector<mx::array> bwd_inputs = {e, c_weight, c_scales, c_biases};
+  bwd_inputs.push_back(has_bias ? bias : mx::array({}));
+  bwd_inputs.push_back(lse);
+  bwd_inputs.push_back(targets);
+  bwd_inputs.push_back(d_nll);
+  bwd_inputs.push_back(tile_max);
+
+  std::vector<mx::Shape> bwd_shapes = {{B, D}};
+  std::vector<mx::Dtype> bwd_dtypes = {mx::float32};
+
+  auto bwd_prim = std::make_shared<CutCrossEntropyQuantizedBwd>(
+      stream, has_bias, group_size);
+  auto vjps = mx::array::make_arrays(
+      bwd_shapes, bwd_dtypes, bwd_prim, bwd_inputs);
+  return mx::astype(vjps[0], e.dtype());
+}
+
+// =========================================================================
 // CPU eval — not implemented, GPU-only operation
 // =========================================================================
 
@@ -195,6 +277,22 @@ void CutCrossEntropyBwd::eval_cpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[CutCrossEntropyBwd] CPU evaluation not implemented. "
+      "Use mx.gpu stream.");
+}
+
+void CutCrossEntropyQuantized::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[CutCrossEntropyQuantized] CPU evaluation not implemented. "
+      "Use mx.gpu stream.");
+}
+
+void CutCrossEntropyQuantizedBwd::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[CutCrossEntropyQuantizedBwd] CPU evaluation not implemented. "
       "Use mx.gpu stream.");
 }
 
@@ -374,6 +472,160 @@ void CutCrossEntropyBwd::eval_gpu(
   enc.dispatch_threadgroups(grid, tg);
 }
 
+// =========================================================================
+// GPU dispatch (quantized forward)
+// =========================================================================
+
+void CutCrossEntropyQuantized::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& d = mx::metal::device(stream().device);
+
+  auto& e = inputs[0];
+  auto& c_weight = inputs[1];
+  auto& c_scales = inputs[2];
+  auto& c_biases = inputs[3];
+  auto& targets = inputs[4];
+
+  uint32_t B = e.shape(0);
+  uint32_t D = e.shape(1);
+  uint32_t V = c_weight.shape(0);
+  uint32_t num_v_tiles = (V + 31) / 32;
+
+  std::string type_name;
+  switch (e.dtype()) {
+    case mx::float32: type_name = "float32"; break;
+    case mx::float16: type_name = "float16"; break;
+    case mx::bfloat16: type_name = "bfloat16"; break;
+    default: throw std::runtime_error("CCE quantized: unsupported dtype");
+  }
+
+  std::string kernel_name = "cce_fwd_q4_" + type_name +
+      "_b" + (has_bias_ ? "true" : "false") + "_ttrue" +
+      "_g" + std::to_string(group_size_);
+
+  auto lib = d.get_library("mlx_cce_ext", current_binary_dir());
+  auto kernel = d.get_kernel(kernel_name, lib);
+  auto& enc = mx::metal::get_command_encoder(stream());
+  enc.set_compute_pipeline_state(kernel);
+
+  auto& tile_max = outputs[0];
+  auto& tile_sum_exp = outputs[1];
+  auto& neg_tgt = outputs[2];
+  auto& lse = outputs[3];
+
+  tile_max.set_data(mx::allocator::malloc(tile_max.nbytes()));
+  tile_sum_exp.set_data(mx::allocator::malloc(tile_sum_exp.nbytes()));
+  neg_tgt.set_data(mx::allocator::malloc(neg_tgt.nbytes()));
+  lse.set_data(mx::allocator::malloc(lse.nbytes()));
+
+  enc.set_input_array(e, 0);
+  enc.set_input_array(c_weight, 1);
+  enc.set_input_array(c_scales, 2);
+  enc.set_input_array(c_biases, 3);
+  enc.set_input_array(has_bias_ ? inputs[5] : e, 4);
+  enc.set_input_array(targets, 5);
+  enc.set_output_array(tile_max, 6);
+  enc.set_output_array(tile_sum_exp, 7);
+  enc.set_output_array(neg_tgt, 8);
+
+  uint32_t shape[3] = {B, D, V};
+  enc.set_bytes(shape, sizeof(shape), 9);
+
+  uint32_t num_b_tiles = B / 32;
+  MTL::Size grid(num_b_tiles, num_v_tiles, 1);
+  MTL::Size tg(32, 1, 1);
+  enc.dispatch_threadgroups(grid, tg);
+
+  auto reduce_kernel = d.get_kernel("reduce_tile_to_lse", lib);
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_input_array(tile_max, 0);
+  enc.set_input_array(tile_sum_exp, 1);
+  enc.set_output_array(lse, 2);
+  uint32_t reduce_params[2] = {B, num_v_tiles};
+  enc.set_bytes(reduce_params, sizeof(reduce_params), 3);
+  constexpr uint32_t reduce_tg = 256;
+  enc.dispatch_threadgroups(
+      MTL::Size((B + reduce_tg - 1) / reduce_tg, 1, 1),
+      MTL::Size(reduce_tg, 1, 1));
+}
+
+// =========================================================================
+// GPU dispatch (quantized backward)
+// =========================================================================
+
+void CutCrossEntropyQuantizedBwd::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& d = mx::metal::device(stream().device);
+
+  // inputs: [e, c_weight, c_scales, c_biases, bias_or_empty, lse, targets, d_nll, tile_max]
+  auto& e = inputs[0];
+  auto& c_weight = inputs[1];
+  auto& c_scales = inputs[2];
+  auto& c_biases = inputs[3];
+  auto& lse = inputs[5];
+  auto& targets = inputs[6];
+  auto& d_nll = inputs[7];
+  auto& tile_max_buf = inputs[8];
+
+  uint32_t B = e.shape(0);
+  uint32_t D = e.shape(1);
+  uint32_t V = c_weight.shape(0);
+  uint32_t num_v_tiles = (V + 4095) / 4096;
+
+  std::string type_name;
+  switch (e.dtype()) {
+    case mx::float32: type_name = "float32"; break;
+    case mx::float16: type_name = "float16"; break;
+    case mx::bfloat16: type_name = "bfloat16"; break;
+    default: throw std::runtime_error("CCE quantized backward: unsupported dtype");
+  }
+
+  std::string kernel_name = "cce_bwd_q4_" + type_name +
+      "_b" + (has_bias_ ? "true" : "false") +
+      "_g" + std::to_string(group_size_);
+
+  auto lib = d.get_library("mlx_cce_ext", current_binary_dir());
+  auto& enc = mx::metal::get_command_encoder(stream());
+
+  auto& dE = outputs[0];
+  dE.set_data(mx::allocator::malloc(dE.nbytes()));
+  {
+    auto fill_kernel = d.get_kernel("fill_zero_f32", lib);
+    enc.set_compute_pipeline_state(fill_kernel);
+    enc.set_output_array(dE, 0);
+    uint32_t count = dE.size();
+    enc.set_bytes(&count, sizeof(uint32_t), 1);
+    constexpr uint32_t fill_tg = 256;
+    enc.dispatch_threadgroups(
+        MTL::Size((count + fill_tg - 1) / fill_tg, 1, 1),
+        MTL::Size(fill_tg, 1, 1));
+  }
+
+  auto kernel = d.get_kernel(kernel_name, lib);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_input_array(e, 0);
+  enc.set_input_array(c_weight, 1);
+  enc.set_input_array(c_scales, 2);
+  enc.set_input_array(c_biases, 3);
+  enc.set_input_array(has_bias_ ? inputs[4] : e, 4);
+  enc.set_input_array(lse, 5);
+  enc.set_input_array(targets, 6);
+  enc.set_input_array(d_nll, 7);
+  enc.set_input_array(tile_max_buf, 8);
+  enc.set_output_array(dE, 9);
+
+  uint32_t shape[3] = {B, D, V};
+  enc.set_bytes(shape, sizeof(shape), 10);
+
+  uint32_t num_b_tiles = B / 32;
+  MTL::Size grid(num_b_tiles, num_v_tiles, 1);
+  MTL::Size tg(256, 1, 1);
+  enc.dispatch_threadgroups(grid, tg);
+}
+
 #else
 
 void CutCrossEntropy::eval_gpu(
@@ -384,6 +636,16 @@ void CutCrossEntropy::eval_gpu(
 void CutCrossEntropyBwd::eval_gpu(
     const std::vector<mx::array>&, std::vector<mx::array>&) {
   throw std::runtime_error("CutCrossEntropyBwd: Metal not built.");
+}
+
+void CutCrossEntropyQuantized::eval_gpu(
+    const std::vector<mx::array>&, std::vector<mx::array>&) {
+  throw std::runtime_error("CutCrossEntropyQuantized: Metal not built.");
+}
+
+void CutCrossEntropyQuantizedBwd::eval_gpu(
+    const std::vector<mx::array>&, std::vector<mx::array>&) {
+  throw std::runtime_error("CutCrossEntropyQuantizedBwd: Metal not built.");
 }
 
 #endif
