@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+dist/
+build/
+.venv/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.so
+*.dylib
+*.metallib
