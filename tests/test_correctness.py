@@ -109,3 +109,60 @@ class TestForward:
         got = linear_cross_entropy(e, c, targets)
         mx.eval(ref, got)
         np.testing.assert_allclose(got.item(), ref.item(), rtol=1e-3)
+
+    @pytest.mark.parametrize("B,D,V,gs", [
+        (32, 64, 1024, 32),
+        (32, 128, 4096, 64),
+        (64, 256, 32000, 128),
+    ])
+    def test_quantized_matches_dequantized(self, B, D, V, gs):
+        mx.random.seed(42)
+        e = mx.random.normal((B, D)).astype(mx.float16)
+        c_full = mx.random.normal((V, D)).astype(mx.float16)
+        targets = mx.random.randint(0, V, (B,))
+        c_weight, c_scales, c_biases = mx.quantize(c_full, group_size=gs, bits=4)
+        c_deq = mx.dequantize(c_weight, c_scales, c_biases, gs, 4)
+        mx.eval(e, targets, c_weight, c_scales, c_biases, c_deq)
+
+        ref = linear_cross_entropy(e, c_deq, targets)
+        got = linear_cross_entropy(e, c_weight, targets,
+                                   scales=c_scales, biases=c_biases,
+                                   group_size=gs, bits=4)
+        mx.eval(ref, got)
+        np.testing.assert_allclose(got.item(), ref.item(), rtol=1e-4)
+
+    def test_quantized_gradient(self):
+        B, D, V, gs = 32, 128, 1024, 64
+        mx.random.seed(42)
+        e = mx.random.normal((B, D)).astype(mx.float16)
+        c_full = mx.random.normal((V, D)).astype(mx.float16)
+        targets = mx.random.randint(0, V, (B,))
+        c_weight, c_scales, c_biases = mx.quantize(c_full, group_size=gs, bits=4)
+        c_deq = mx.dequantize(c_weight, c_scales, c_biases, gs, 4)
+        mx.eval(e, targets, c_weight, c_scales, c_biases, c_deq)
+
+        grad_ref = mx.grad(lambda x: linear_cross_entropy(x, c_deq, targets))(e)
+        grad_q = mx.grad(lambda x: linear_cross_entropy(
+            x, c_weight, targets, scales=c_scales, biases=c_biases,
+            group_size=gs, bits=4))(e)
+        mx.eval(grad_ref, grad_q)
+
+        rel = (mx.max(mx.abs(grad_ref - grad_q)) / mx.max(mx.abs(grad_ref))).item()
+        assert rel < 0.01, f"Gradient relative error {rel:.6f} > 0.01"
+
+    def test_quantized_ignore_index(self):
+        B, D, V, gs = 32, 128, 1024, 64
+        mx.random.seed(42)
+        e = mx.random.normal((B, D)).astype(mx.float16)
+        c_full = mx.random.normal((V, D)).astype(mx.float16)
+        targets = mx.random.randint(0, V, (B,))
+        targets_masked = mx.where(mx.arange(B) < 16, targets, mx.full((B,), -100))
+        c_weight, c_scales, c_biases = mx.quantize(c_full, group_size=gs, bits=4)
+        c_deq = mx.dequantize(c_weight, c_scales, c_biases, gs, 4)
+        mx.eval(e, targets_masked, c_weight, c_scales, c_biases, c_deq)
+
+        ref = linear_cross_entropy(e, c_deq, targets_masked, ignore_index=-100)
+        got = linear_cross_entropy(e, c_weight, targets_masked, ignore_index=-100,
+                                   scales=c_scales, biases=c_biases, group_size=gs, bits=4)
+        mx.eval(ref, got)
+        np.testing.assert_allclose(got.item(), ref.item(), rtol=1e-4)

@@ -87,20 +87,23 @@ def cce_loss(model, batch, lengths):
     else:
         embed = model.lm_head
 
-    # Dequantize if model is quantized (4-bit, 8-bit, etc.)
-    if hasattr(embed, "scales"):
-        c = mx.dequantize(embed.weight, embed.scales, embed.biases,
-                          embed.group_size, embed.bits)
-    else:
-        c = embed.weight
-
     # Apply sequence mask
     steps = mx.arange(1, targets.shape[1] + 1)
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
     targets = mx.where(mask, targets, mx.full(targets.shape, -100))
     ntoks = mask.sum()
 
-    loss = linear_cross_entropy(hidden, c, targets, reduction="sum") / ntoks
+    # CCE reads quantized weights directly — no mx.dequantize() needed
+    if hasattr(embed, "scales"):
+        loss = linear_cross_entropy(
+            hidden, embed.weight, targets, reduction="sum",
+            scales=embed.scales, biases=embed.biases,
+            group_size=embed.group_size, bits=embed.bits,
+        ) / ntoks
+    else:
+        loss = linear_cross_entropy(
+            hidden, embed.weight, targets, reduction="sum",
+        ) / ntoks
     return loss, ntoks
 
 # from mlx_lm.tuner.trainer import train
@@ -133,22 +136,27 @@ Isolated kernel benchmarks (B=1024, V=128256, D=2048, M-series):
 
 CCE backward is faster due to gradient filtering (skipping 75-95% of tiles). Forward is slightly slower due to tiled reduction overhead. Total throughput is comparable, with dramatically less memory.
 
-**Note:** For quantized models, the classifier weight must be dequantized before passing to CCE, which adds overhead. For non-quantized (float16/float32) models, CCE matches standard CE speed while using 32x less memory for the loss computation.
+**Quantized models:** CCE reads packed 4-bit weights directly — no `mx.dequantize()` needed. Pass `scales`, `biases`, `group_size`, and `bits` to `linear_cross_entropy` and the Metal kernel dequantizes on-the-fly per tile, saving ~500 MB of memory that a full dequantization would allocate.
 
 ## API
 
 ```python
-linear_cross_entropy(e, c, targets, bias=None, reduction="mean", ignore_index=-100)
+linear_cross_entropy(e, c, targets, bias=None, reduction="mean", ignore_index=-100,
+                     scales=None, biases=None, group_size=64, bits=4)
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `e` | `mx.array` | required | Hidden states `[..., D]` |
-| `c` | `mx.array` | required | Classifier weights `[V, D]` |
+| `c` | `mx.array` | required | Classifier weights `[V, D]` or packed `[V, D/8]` (uint32) |
 | `targets` | `mx.array` | required | Target indices `[...]` |
 | `bias` | `mx.array` | `None` | Classifier bias `[V]` |
 | `reduction` | `str` | `"mean"` | `"mean"`, `"sum"`, or `"none"` |
 | `ignore_index` | `int` | `-100` | Target index to mask |
+| `scales` | `mx.array` | `None` | Quantization scales `[V, D/group_size]` |
+| `biases` | `mx.array` | `None` | Quantization biases `[V, D/group_size]` |
+| `group_size` | `int` | `64` | Quantization group size (32, 64, or 128) |
+| `bits` | `int` | `4` | Quantization bit width (only 4 supported) |
 
 Lower-level: `cce_loss(e, c, targets)` takes flat `[B, D]` inputs directly.
 
