@@ -3,7 +3,7 @@ from mlx import extension
 
 if __name__ == "__main__":
     setup(
-        name="mlx-cce",
+        name="mlx-cross-entropy",
         version="0.1.0",
         description="Memory-efficient Cut Cross-Entropy for MLX with native Metal kernels.",
         ext_modules=[extension.CMakeExtension("mlx_cce._ext")],

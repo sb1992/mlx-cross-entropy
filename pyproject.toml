@@ -8,7 +8,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mlx-cce"
+name = "mlx-cross-entropy"
 dynamic = ["version"]
 description = "Memory-efficient Cut Cross-Entropy for MLX on Apple Silicon"
 readme = "README.md"
@@ -31,9 +31,9 @@ classifiers = [
 dev = ["pytest", "ruff"]
 
 [project.urls]
-Homepage = "https://github.com/ShreyBhatia/mlx-cce"
+Homepage = "https://github.com/sb1992/mlx-cross-entropy"
 Paper = "https://arxiv.org/abs/2411.09009"
-Issues = "https://github.com/ShreyBhatia/mlx-cce/issues"
+Issues = "https://github.com/sb1992/mlx-cross-entropy/issues"
 
 [tool.setuptools.packages.find]
 include = ["mlx_cce*"]
